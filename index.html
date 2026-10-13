@@ -8,6 +8,8 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <meta name="theme-color" content="#ffffff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="냉장고 관리">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jua&display=swap">
 <style>
 :root{--bg:#fdf3f6;--card:rgba(255,255,255,.94);--line:#eee6ea;--text:#3a3438;--sub:#9a9096;--accent:#e0789f;--red:#e03131;--redbg:#fff1f1}
@@ -27,6 +29,10 @@ h1{font-family:'Jua','Malgun Gothic',sans-serif;font-weight:400;font-size:22px;m
 .tsw{border:2px solid var(--line);border-radius:12px;background:#fff;padding:6px 6px 4px;cursor:pointer;width:104px}
 .tsw .pv{height:60px;border-radius:8px;background-color:#fff;background-size:192px}
 .tsw.on{border-color:var(--accent)}
+.code-box{display:inline-block;margin:12px 0 6px;padding:8px 16px;border-radius:10px;background:var(--bg);color:var(--accent);font-family:'Jua','Malgun Gothic',sans-serif;font-size:24px;letter-spacing:3px;user-select:all;white-space:nowrap}
+.sync-on{color:#2f9e6e}.sync-denied{color:var(--red)}
+.sdot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-left:5px;vertical-align:2px;background:#bbb}
+.sdot.on{background:#3cc48a}.sdot.denied{background:var(--red)}
 .tgrid{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
 .set-row{display:flex;gap:8px;margin-top:10px}
 .badge{display:inline-block;min-width:18px;padding:0 5px;margin-left:4px;border-radius:9px;background:var(--red);color:#fff;font-size:11px;line-height:18px;text-align:center}
@@ -164,6 +170,8 @@ td.acts{grid-area:acts;text-align:left}
 td.acts button{padding:4px 8px}
 .qty button{width:30px;height:30px}
 #guide{left:10px;right:10px;width:auto;bottom:84px}
+/* 아이폰: 16px 미만 입력칸을 누르면 화면이 확대되는 것 방지 */
+input,select,textarea,.dlg label input,.dlg label select,.dlg label textarea,.search{font-size:16px}
 .dlg{padding:18px 16px}
 }
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:10px;display:flex;gap:14px;align-items:center;z-index:30;font-size:13px}
@@ -222,7 +230,82 @@ d.v=2;
 }
 return d;
 }
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){toast('저장에 실패했어요. 백업 저장을 이용해 주세요.')}}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){toast('저장에 실패했어요. 백업 저장을 이용해 주세요.')}schedulePush()}
+
+// ---------- 가족과 공유 (Firebase Realtime Database) ----------
+// 같은 집 코드의 기기끼리 데이터 전체를 맞춤. 테마는 기기마다 따로.
+const DB='https://fridge-7c7c8-default-rtdb.firebaseio.com';
+const SYNC_KEY='fridge-sync';
+const sync={code:'',status:'off',es:null,timer:null,last:'',dirty:false,applying:false};
+try{const v=JSON.parse(localStorage.getItem(SYNC_KEY)||'{}');sync.code=v.code||'';sync.dirty=!!v.dirty}catch(e){}
+const syncMeta=()=>{try{localStorage.setItem(SYNC_KEY,JSON.stringify({code:sync.code,dirty:sync.dirty}))}catch(e){}};
+const nodeUrl=()=>`${DB}/households/${sync.code}.json`;
+const fmtCode=c=>c.slice(0,5)+'-'+c.slice(5);
+function payload(){const c=JSON.parse(JSON.stringify(S));delete c.theme;return JSON.stringify(c)}
+function setSync(st){sync.status=st;renderTabs();if(ui.tab==='set')renderSet()}
+function schedulePush(){
+if(!sync.code||sync.applying)return;
+if(payload()===sync.last)return;
+sync.dirty=true;syncMeta();clearTimeout(sync.timer);sync.timer=setTimeout(pushNow,400);
+}
+async function pushNow(){
+const p=payload();
+try{const r=await fetch(nodeUrl(),{method:'PUT',body:JSON.stringify({data:p,at:{'.sv':'timestamp'}})});if(!r.ok)throw r.status;
+sync.last=p;sync.dirty=false;syncMeta();setSync('on')}
+catch(e){setSync(e===401?'denied':'offline')}
+}
+function applyRemote(node){
+if(!node||typeof node.data!=='string')return;
+if(node.data===payload()){sync.last=node.data;return}
+if(sync.dirty)return pushNow(); // 아직 안 올라간 내 변경이 있으면 내 쪽을 올림
+let d;try{d=migrate(JSON.parse(node.data))}catch(e){return}
+d.theme=S.theme;
+sync.applying=true;S=d;save();sync.applying=false;sync.last=node.data;
+render();
+}
+function listen(){
+if(sync.es)sync.es.close();sync.es=null;
+if(!sync.code)return;
+setSync('connecting');
+const es=new EventSource(nodeUrl());sync.es=es;
+const onEv=e=>{
+let m;try{m=JSON.parse(e.data)}catch(err){return}
+setSync('on');
+if(m.path==='/'){if(m.data===null)pushNow();else applyRemote(m.data)}
+else fetch(nodeUrl()).then(r=>r.json()).then(applyRemote).catch(()=>{});
+};
+es.addEventListener('put',onEv);es.addEventListener('patch',onEv);
+es.addEventListener('cancel',()=>setSync('denied'));
+es.onerror=()=>{if(sync.status!=='denied')setSync('offline')};
+}
+async function startShare(){
+const A='ABCDEFGHJKLMNPQRSTUVWXYZ23456789',rnd=crypto.getRandomValues(new Uint8Array(10));let c='';
+for(const b of rnd)c+=A[b%A.length];
+sync.code=c;sync.last='';sync.dirty=true;syncMeta();
+await pushNow();
+if(sync.status!=='on'){toast(sync.status==='denied'?'저장소 규칙 때문에 연결이 거부됐어요':'연결하지 못했어요. 인터넷을 확인해 주세요');sync.code='';sync.dirty=false;syncMeta();setSync('off');return}
+listen();toast('공유를 시작했어요! 코드를 같이 사는 사람에게 알려주세요');
+}
+function joinForm(){
+openModal('코드로 참여',`<label>우리 집 코드<input id="j-code" placeholder="예: 7K2PX-Q9MAB" autocomplete="off" style="text-transform:uppercase"></label><div class="hint">참여하면 이 기기의 냉장고가 공유 냉장고 내용으로 바뀌어요. 지금 데이터가 필요하면 먼저 '백업 저장'을 해 두세요.</div>`,
+[{label:'취소'},{label:'참여',primary:true,fn:()=>{const c=$('j-code').value.toUpperCase().replace(/[^A-Z0-9]/g,'');if(c.length!==10){$('j-code').focus();return false}joinWith(c)}}]);
+}
+async function joinWith(c){
+try{
+const r=await fetch(`${DB}/households/${c}.json`);if(!r.ok)throw r.status;
+const node=await r.json();
+if(!node||typeof node.data!=='string')return toast('그런 코드가 없어요. 다시 확인해 주세요');
+if(sync.es)sync.es.close();
+sync.code=c;sync.dirty=false;sync.last='';syncMeta();applyRemote(node);listen();
+toast('공유 냉장고에 참여했어요');
+}catch(e){toast(e===401?'저장소 규칙 때문에 연결이 거부됐어요':'연결하지 못했어요. 인터넷을 확인해 주세요')}
+}
+function leaveShare(){
+confirmBox('공유 끊기','이 기기만 공유를 그만둬요. 지금 냉장고 내용은 그대로 남고, 이후 변경은 다른 사람과 맞춰지지 않아요.','끊기',()=>{
+if(sync.es)sync.es.close();sync.es=null;clearTimeout(sync.timer);sync.code='';sync.dirty=false;syncMeta();setSync('off');toast('공유를 끊었어요');
+},true);
+}
+window.addEventListener('online',()=>{if(sync.code){if(sync.dirty)pushNow();if(!sync.es||sync.es.readyState===2)listen()}});
 function change(fn,msg){const snap=JSON.stringify(S);fn();save();render();if(msg)toast(msg,snap)}
 
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,6);
@@ -283,18 +366,25 @@ document.body.style.backgroundImage=patternSVG(t);
 // ---------- 렌더 ----------
 function render(){
 applyTheme();
-const warn=S.items.filter(isWarn).length,tab=(k,label)=>`<button class="tab ${ui.tab===k?'on':''}" data-tab="${k}">${label}</button>`;
-$('tabs').innerHTML=tab('inv',`냉장고${warn?`<span class="badge">${warn}</span>`:''}`)+tab('rec','레시피북');
-$('tabs2').innerHTML=tab('set','<svg class="gear" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></svg>설정');
+renderTabs();
 const names=new Set();S.categories.forEach(c=>c.presets.forEach(p=>names.add(p.name)));S.items.forEach(i=>names.add(i.name));S.recipes.forEach(r=>r.ings.forEach(g=>names.add(g.name)));
 $('names').innerHTML=[...names].map(n=>`<option value="${esc(n)}">`).join('');
 renderDrawer();
 if(ui.tab==='inv')renderInv();else if(ui.tab==='rec')renderRec();else renderSet();
 }
+function renderTabs(){
+const warn=S.items.filter(isWarn).length,tab=(k,label)=>`<button class="tab ${ui.tab===k?'on':''}" data-tab="${k}">${label}</button>`;
+$('tabs').innerHTML=tab('inv',`냉장고${warn?`<span class="badge">${warn}</span>`:''}`)+tab('rec','레시피북');
+$('tabs2').innerHTML=tab('set','<svg class="gear" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></svg>설정'+(sync.code?`<span class="sdot ${sync.status}" title="가족과 공유 중"></span>`:''));
+}
 
 function renderSet(){
 const cur=THEMES[S.theme]?S.theme:'pink';
-$('main').innerHTML=`<section class="card"><h2>테마 색상</h2><div class="hint">배경 패턴과 버튼 색이 함께 바뀌어요</div><div class="tgrid">${Object.entries(THEMES).map(([k,t])=>`<button class="tsw ${k===cur?'on':''}" data-act="theme" data-id="${k}"><div class="pv" style='background-image:${patternSVG(t)}'></div><div class="cute" style="color:${t.accent};margin-top:4px">${t.name}</div></button>`).join('')}</div></section>
+const st={on:'● 연결됨 · 실시간으로 맞추는 중',connecting:'연결 중…',offline:'오프라인 · 인터넷이 연결되면 자동으로 맞춰요',denied:'연결이 거부됐어요 · 저장소 규칙을 확인해 주세요',off:''}[sync.status];
+const share=sync.code
+?`<section class="card"><h2>가족과 공유</h2><div class="hint">같은 코드를 입력한 기기끼리 재료·레시피가 실시간으로 맞춰져요. 테마 색은 기기마다 따로예요.</div><div class="code-box">${fmtCode(sync.code)}</div><div class="hint sync-${sync.status}">${st}</div><div class="set-row"><button class="btn" data-act="copyCode">코드 복사</button><button class="btn danger" data-act="leaveShare">공유 끊기</button></div></section>`
+:`<section class="card"><h2>가족과 공유</h2><div class="hint">같이 사는 사람과 냉장고를 함께 써요. 한 사람이 '공유 시작'으로 코드를 만들고, 다른 사람은 '코드로 참여'에 그 코드를 입력하면 돼요.</div><div class="set-row"><button class="btn primary" data-act="startShare">공유 시작</button><button class="btn" data-act="joinShare">코드로 참여</button></div></section>`;
+$('main').innerHTML=share+`<section class="card"><h2>테마 색상</h2><div class="hint">배경 패턴과 버튼 색이 함께 바뀌어요</div><div class="tgrid">${Object.entries(THEMES).map(([k,t])=>`<button class="tsw ${k===cur?'on':''}" data-act="theme" data-id="${k}"><div class="pv" style='background-image:${patternSVG(t)}'></div><div class="cute" style="color:${t.accent};margin-top:4px">${t.name}</div></button>`).join('')}</div></section>
 <section class="card"><h2>데이터 백업</h2><div class="hint">데이터는 이 브라우저 안에 자동으로 저장돼요. 다른 PC나 브라우저로 옮기거나 만일을 대비해 가끔 파일로 백업해 두세요.</div><div class="set-row"><button class="btn" data-act="export">백업 저장</button><button class="btn" data-act="import">불러오기</button></div></section>
 <section class="card"><h2>사용법</h2><div class="hint">처음에 보였던 간단 사용법을 다시 볼 수 있어요.</div><div class="set-row"><button class="btn" data-act="guide">사용법 다시 보기</button></div></section>`;
 }
@@ -523,6 +613,10 @@ editItem:()=>itemForm(item),
 keep:()=>keepForm(item),
 unkeep:()=>change(()=>item.kept=false,`${item.name} 보관 해제했어요`),
 guide:()=>showGuide(),
+startShare:()=>startShare(),
+joinShare:()=>joinForm(),
+leaveShare:()=>leaveShare(),
+copyCode:()=>{const c=fmtCode(sync.code);(navigator.clipboard?navigator.clipboard.writeText(c):Promise.reject()).then(()=>toast(`코드 ${c} 를 복사했어요`),()=>toast(`코드: ${c}`))},
 delItem:()=>change(()=>S.items=S.items.filter(x=>x.id!==id),`${item.name} 삭제했어요`),
 inc:()=>change(()=>item.qty=r2(item.qty+1)),
 dec:()=>item.qty<=1?change(()=>S.items=S.items.filter(x=>x.id!==id),`${item.name} 다 써서 목록에서 뺐어요`):change(()=>item.qty=r2(item.qty-1)),
@@ -539,6 +633,7 @@ delRecipe:()=>confirmBox('레시피 삭제',`'${esc(rec.name)}' 레시피를 삭
 cook:()=>cook(id),
 theme:()=>{S.theme=id;save();render()},
 export:()=>{
+if(window.AndroidBridge){AndroidBridge.saveFile(`냉장고_백업_${ymd(0)}.json`,JSON.stringify(S,null,1));return} // 안드로이드 앱: 저장 위치 선택 창
 const url=URL.createObjectURL(new Blob([JSON.stringify(S,null,1)],{type:'application/json'}));
 const a=document.createElement('a');a.href=url;a.download=`냉장고_백업_${ymd(0)}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 },
@@ -558,9 +653,10 @@ const GUIDE_KEY='fridge-guide-seen';
 function showGuide(){$('guide').hidden=false;$('handle').classList.add('peek')}
 $('guideOk').onclick=()=>{$('guide').hidden=true;$('handle').classList.remove('peek');try{localStorage.setItem(GUIDE_KEY,'1')}catch(e){}};
 render();
+if(sync.code)listen();
 try{if(!localStorage.getItem(GUIDE_KEY))showGuide()}catch(e){}
 // 앱 설치·오프라인용 (웹 주소로 열었을 때만 동작)
-if('serviceWorker' in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('sw.js').catch(()=>{});
+if('serviceWorker' in navigator&&location.protocol.startsWith('http')&&location.hostname!=='fridge.example')navigator.serviceWorker.register('sw.js').catch(()=>{});
 </script>
 </body>
 </html>
